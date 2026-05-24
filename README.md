@@ -1,139 +1,167 @@
-
 # api server
 
 High-performance C/Lua API server powered by libmicrohttpd, yyjson, LuaJIT, and jemalloc.
 
 ---
 
-## 工程结构
+## Project Structure
 
 ```
-jsonrpc_server/
+.
 ├── Makefile
+├── deps/                    # All third-party dependencies (Git submodules)
+│   ├── yyjson/              #   yyjson  (JSON parser)
+│   ├── luajit/              #   LuaJIT (Lua engine)
+│   ├── jemalloc/            #   jemalloc (memory allocator)
+│   └── libmicrohttpd/       #   libmicrohttpd (HTTP server)
 ├── src/
-│   ├── log.h            线程安全日志宏（4级别 + 时间戳 + TID）
-│   ├── uuid.h/c         RFC-4122 v4 UUID，/dev/urandom
-│   ├── auth.h/c         认证桩（valid_* / admin_* token）
-│   ├── jsonrpc.h/c      JSONRPC 2.0 协议：解析 + 响应构建（yyjson）
-│   ├── task_manager.h/c 异步任务生命周期管理
-│   ├── worker_pool.h/c  pthread 线程池
-│   ├── methods.h/c      方法注册表 + 内置方法实现
-│   ├── server.h/c       MHD 服务器：连接管理 / suspend-resume
-│   └── main.c           启动 / 信号 / 优雅关机
+│   ├── main.c               # Entry point: startup, signals, graceful shutdown
+│   ├── server.c / server.h  # MHD server: connection management, suspend/resume
+│   ├── jsonrpc.c / jsonrpc.h# JSON‑RPC 2.0 parsing & response construction (yyjson)
+│   ├── auth.c / auth.h      # Authentication stubs (valid_* / admin_* tokens)
+│   ├── task_manager.c / .h  # Async task lifecycle manager (64‑bucket hash table)
+│   ├── worker_pool.c / .h   # Thread pool (pthread)
+│   ├── methods.c / methods.h# Method registry & built-in implementations
+│   ├── uuid.c / uuid.h      # RFC‑4122 v4 UUID (/dev/urandom)
+│   └── log.h                # Thread-safe logging macros (4 levels + timestamp + TID)
 ├── tools/
-│   └── rpc_debug.c      调试 CLI 工具
-└── third_party/
-    ├── yyjson.h          (make 自动下载)
-    └── yyjson.c
+│   └── rpc_debug.c          # Debug CLI tool
+├── LICENSE
+└── README.md
 ```
+
+> **Note**: All libraries under `deps/` are managed as Git submodules.
+> The first build will automatically initialize and compile these dependencies – no manual downloads or installations required.
 
 ---
 
-## 关键设计
+## Key Design
 
-### MHD 并发控制
+### MHD Concurrency Control
 
-| 参数                              | 值                              |
-| --------------------------------- | ------------------------------- |
-| `MHD_USE_INTERNAL_POLLING_THREAD` | MHD 内部线程模式                |
-| `MHD_ALLOW_SUSPEND_RESUME`        | 连接可挂起/恢复（异步派发核心） |
-| `MHD_OPTION_THREAD_POOL_SIZE`     | `max(1, nCPU/2)`                |
-| `MHD_OPTION_CONNECTION_LIMIT`     | 3（最大并发连接数）             |
+| Parameter                         | Value                                |
+| --------------------------------- | ------------------------------------ |
+| `MHD_USE_INTERNAL_POLLING_THREAD` | MHD internal thread mode             |
+| `MHD_ALLOW_SUSPEND_RESUME`        | Suspend/resume for async dispatching |
+| `MHD_OPTION_THREAD_POOL_SIZE`     | `max(1, nCPU/2)`                     |
+| `MHD_OPTION_CONNECTION_LIMIT`     | 3 (max concurrent connections)       |
 
-### 同步方法（suspend/resume 流程）
+### Synchronous Methods (suspend/resume flow)
 
 ```
-MHD handler → 解析 → 认证 → MHD_suspend_connection()
-    → worker_pool_submit() → 返回 MHD_YES
-                                   ↓ worker线程
-                            执行业务 → 写入 ci->resp_body
+MHD handler → parse → auth → MHD_suspend_connection()
+    → worker_pool_submit() → return MHD_YES
+                                   ↓ worker thread
+                            execute business logic → write ci->resp_body
                             MHD_resume_connection()
-                                   ↓ MHD唤醒
-MHD handler 再次被调用 → state=CI_READY → 发送响应
+                                   ↓ MHD wakes up
+MHD handler invoked again → state=CI_READY → send response
 ```
 
-### 异步方法（202 ACCEPTED 流程）
+### Asynchronous Methods (202 ACCEPTED flow)
 
 ```
 MHD handler → task_create() → worker_pool_submit(async_work)
-           → 立刻返回 202 ACCEPTED + task_id
-                                   ↓ 后台worker
+           → immediately return 202 ACCEPTED + task_id
+                                   ↓ background worker
                             task_set_running()
-                            真正执行（可分钟级）
+                            real work (can take minutes)
                             task_complete() / task_fail()
-客户端 → task.status  → 轮询结果
-       → task.cancel  → 取消
-       → task.refresh → 重置超时 deadline
-       → task.list    → 列出本用户所有任务
+Client → task.status  → poll for result
+       → task.cancel  → cancel
+       → task.refresh → reset timeout deadline
+       → task.list    → list all tasks for this user
 ```
 
 ### Task Manager
 
-- **64-bucket 哈希表**，每桶独立 mutex，高并发下减少锁竞争
-- **Reaper 线程**每 2 秒扫描：超时任务标 `TIMED_OUT`，1小时以上终态任务自动清理
-- 任务所有权：只有 owner 或 admin 可取消/查看
+- **64‑bucket hash table**, each bucket with its own mutex – reduces lock contention under high concurrency.
+- **Reaper thread** scans every 2 seconds: expired tasks marked `TIMED_OUT`, terminal tasks older than 1 hour automatically cleaned up.
+- Task ownership: only the owner or an admin can cancel / view a task.
 
 ---
 
-## 快速上手
+## Quick Start
+
+### Build
 
 ```bash
-# 构建
+# Clone with submodules
+git clone --recurse-submodules <your-repo-url>
+# If already cloned, init submodules manually
+git submodule update --init --recursive
+
+# Build (automatically compiles all deps and the project)
 make
+```
 
-# optional:
-export LD_LIBRARY_PATH=lib:$LD_LIBRARY_PATH     # Linux
-export DYLD_LIBRARY_PATH=lib:$DYLD_LIBRARY_PATH # Macos
+All dependencies are statically linked into the final binaries – no extra library path configuration needed.
 
-# 运行（调试日志）
+### Run & Test
+
+```bash
+# Start the server (debug logging)
 ./build/jsonrpc-server -l 0 -p 8080
 
-# 基本调用
+# Basic JSON‑RPC calls
 ./build/rpc_debug ping
 ./build/rpc_debug -r add '{"a":3,"b":4}'
 
-# 异步任务（自动轮询直到完成）
+# Async task (auto-polls until complete)
 ./build/rpc_debug -r -P slow_compute '{"n":5}'
 
-# 认证测试
-./build/rpc_debug -s bad_token ping           # 返回 -32000
-./build/rpc_debug -s admin_root task.list     # admin 查看全部
+# Auth tests
+./build/rpc_debug -s bad_token ping           # returns -32000
+./build/rpc_debug -s admin_root task.list     # admin sees all tasks
 
-# 任务管理
-./build/rpc_debug slow_compute '{"n":10}' | grep task_id   # 拿到ID
+# Task management
+./build/rpc_debug slow_compute '{"n":10}' | grep task_id   # get task_id
 ./build/rpc_debug task.cancel '{"task_id":"<uuid>"}'
 ./build/rpc_debug task.refresh '{"task_id":"<uuid>"}'
 
-# 集成冒烟测试
+# Smoke tests
 make test
 
-# AddressSanitizer 构建
+# Build with AddressSanitizer
 make asan
 ```
 
 ---
 
-## 扩展 auth_verify
+## Extension Guide
 
-`src/auth.c` 中的 `auth_verify()` 是整个认证的唯一入口，将其换成真实逻辑（JWT 验签、Redis 查询等）而无需改动其他任何文件：
+### Authentication
+
+`auth_verify()` in `src/auth.c` is the single entry point for all auth. Replace it with real logic (JWT validation, Redis lookup, etc.) without touching any other file:
 
 ```c
 bool auth_verify(const char *token, user_info_t *out) {
-    // 例：调用 Redis / JWT 库
+    // e.g., call JWT / Redis
     return jwt_verify(token, out->username, out->role);
 }
 ```
 
-## 新增业务方法
+### Adding Business Methods
 
-在 `src/methods.c` 末尾注册即可：
+Register new methods at the end of `src/methods.c`:
 
 ```c
-// 同步
+// Synchronous handler
 static char *method_my_sync(const user_info_t *u, yyjson_val *p,
-                             int *ec, char *em, size_t esz) { ... }
+                             int *ec, char *em, size_t esz) {
+    // business logic
+    return strdup("...");
+}
 
-// 注册到表
-{ "my.sync",  false, 0,   method_my_sync,  NULL },
-{ "my.async", true,  120, NULL, method_my_async_worker },
-```
+// Asynchronous worker
+static void method_my_async_worker(task_t *task) {
+    // long-running computation
+    task_complete(task, "result");
+}
+
+// Register in the method table
+static const method_entry_t methods[] = {
+    ...
+    { "my.sync",  false, 0,   method_my_sync,  NULL },
+    { "my.async", true,  120, NULL, method_my_async_worker },
+};
