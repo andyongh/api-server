@@ -165,3 +165,23 @@ static const method_entry_t methods[] = {
     { "my.sync",  false, 0,   method_my_sync,  NULL },
     { "my.async", true,  120, NULL, method_my_async_worker },
 };
+```
+
+## Submodule 管理
+
+- 增加
+
+```sh
+git submodule add https://github.com/ibireme/yyjson deps/yyjson
+git submodule add https://github.com/luajit/luajit deps/luajit
+git submodule add https://github.com/jemalloc/jemalloc deps/jemalloc
+git submodule add https://git.gnunet.org/libmicrohttpd.git deps/libmicrohttpd
+```
+
+- 移除
+
+```sh
+git submodule deinit -f deps/libmicrohttpd
+git rm -f deps/libmicrohttpd
+rm -rf .git/modules/deps/libmicrohttpd
+```
