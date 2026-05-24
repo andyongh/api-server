@@ -1,0 +1,12 @@
+[submodule "deps/yyjson"]
+	path = deps/yyjson
+	url = https://github.com/ibireme/yyjson
+[submodule "deps/luajit"]
+	path = deps/luajit
+	url = https://github.com/luajit/luajit
+[submodule "deps/jemalloc"]
+	path = deps/jemalloc
+	url = https://github.com/jemalloc/jemalloc
+[submodule "deps/libmicrohttpd"]
+	path = deps/libmicrohttpd
+	url = https://git.gnunet.org/libmicrohttpd.git

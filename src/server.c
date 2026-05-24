@@ -10,312 +10,234 @@
 #include <stdio.h>
 
 /* ── Per-connection state ─────────────────────────────────────────────── */
-typedef enum {
-    CI_READING    = 0,  /* accumulating request body                     */
-    CI_PROCESSING = 1,  /* suspended; worker is running                  */
-    CI_READY      = 2,  /* worker done; response ready to send           */
-} ci_state_t;
+typedef enum { CI_READING=0, CI_PROCESSING=1, CI_READY=2 } ci_state_t;
 
-typedef struct conn_info_s {
-    volatile ci_state_t  state;
+typedef struct {
+    volatile ci_state_t state;
     struct MHD_Connection *mhd_conn;
-
-    /* Request accumulation */
-    char   *req_body;
-    size_t  req_body_len;
-    size_t  req_body_cap;
-    bool    body_too_large;
-
-    /* Response (set by worker before resume) */
-    char   *resp_body;      /* heap — MUST_FREE so MHD frees it         */
-    size_t  resp_body_len;
-    int     http_status;
+    char   *req;  size_t req_len; size_t req_cap;
+    bool    too_large;
+    char   *resp; int    http_status;
 } conn_info_t;
 
-/* ── Sync-dispatch work context ───────────────────────────────────────── */
+/* ── Sync dispatch context ────────────────────────────────────────────── */
 typedef struct {
-    conn_info_t   *ci;
-    jrpc_req_t    *req;
+    conn_info_t          *ci;
+    jrpc_req_t           *req;
     const method_entry_t *entry;
-} sync_work_ctx_t;
+} sync_ctx_t;
 
-/* ── Helpers ──────────────────────────────────────────────────────────── */
-static void add_common_headers(struct MHD_Response *resp) {
-    MHD_add_response_header(resp, "Content-Type", "application/json");
-    MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-    MHD_add_response_header(resp, "Access-Control-Allow-Headers",
-                            "Content-Type");
+/* ── task_runner ──────────────────────────────────────────────────────────
+ *
+ * Submitted to the worker pool for every async task.
+ * Signature is work_fn_t = void(*)(void*), which equals task_work_fn_t.
+ *
+ * Flow:
+ *   task->fn is set to entry->async_fn before submission.
+ *   Both task->fn and entry->async_fn are void(*)(void*).
+ *   No cast needed when assigning.  arg → task_t* cast happens here
+ *   and inside the actual business function.
+ */
+static void task_runner(void *arg){
+    task_t *task=(task_t *)arg;
+    task_mark_running(task);        /* PENDING→RUNNING via direct pointer   */
+    task->fn((void *)task);         /* business fn: void(*)(void*)          */
 }
 
-static enum MHD_Result send_json(struct MHD_Connection *conn,
-                                  int status, char *body_heap) {
-    /* body_heap ownership passes to MHD (MUST_FREE) */
-    size_t len = strlen(body_heap);
-    struct MHD_Response *resp =
-        MHD_create_response_from_buffer(len, body_heap, MHD_RESPMEM_MUST_FREE);
-    if (!resp) { free(body_heap); return MHD_NO; }
-    add_common_headers(resp);
-    enum MHD_Result ret = MHD_queue_response(conn, (unsigned int)status, resp);
-    MHD_destroy_response(resp);
+/* ── do_sync ──────────────────────────────────────────────────────────── */
+static void do_sync(void *arg){
+    sync_ctx_t *ctx=(sync_ctx_t *)arg;
+    conn_info_t *ci=ctx->ci;
+    jrpc_req_t  *req=ctx->req;
+    const method_entry_t *entry=ctx->entry;
+    free(ctx);
+
+    int  ec=0; char em[512]={0};
+    char *result=entry->sync_fn(&req->user,req->params,&ec,em,sizeof(em));
+    char *body=result ? jrpc_result(req->id_str,result)
+                      : jrpc_error (req->id_str,ec,em);
+    free(result);
+    jrpc_req_free(req);
+
+    ci->resp=body;
+    ci->http_status=200;
+    __atomic_store_n((int*)&ci->state,CI_READY,__ATOMIC_SEQ_CST);
+    MHD_resume_connection(ci->mhd_conn);
+    LOGD("sync done, connection resumed");
+}
+
+/* ── Helpers ──────────────────────────────────────────────────────────── */
+static void add_headers(struct MHD_Response *r){
+    MHD_add_response_header(r,"Content-Type","application/json");
+    MHD_add_response_header(r,"Access-Control-Allow-Origin","*");
+}
+
+static enum MHD_Result send_json(struct MHD_Connection *c,int status,char *body){
+    struct MHD_Response *r=MHD_create_response_from_buffer(
+        strlen(body),body,MHD_RESPMEM_MUST_FREE);
+    if(!r){free(body);return MHD_NO;}
+    add_headers(r);
+    enum MHD_Result ret=MHD_queue_response(c,(unsigned int)status,r);
+    MHD_destroy_response(r);
     return ret;
 }
 
-/* ── Sync worker ──────────────────────────────────────────────────────── */
-static void do_sync_work(void *arg) {
-    sync_work_ctx_t *ctx = arg;
-    conn_info_t     *ci  = ctx->ci;
-    jrpc_req_t      *req = ctx->req;
-    const method_entry_t *entry = ctx->entry;
-
-    int  err_code = 0;
-    char err_msg[512] = {0};
-
-    char *result = entry->sync_fn(&req->user, req->params,
-                                   &err_code, err_msg, sizeof(err_msg));
-    char *resp_body;
-    if (result) {
-        resp_body = jrpc_build_result(req->id_str, result);
-        free(result);
-    } else {
-        resp_body = jrpc_build_error(req->id_str, err_code, err_msg);
-    }
-
-    jrpc_req_free(req);
-    free(ctx);
-
-    /* Store response and resume the MHD connection */
-    ci->resp_body     = resp_body;
-    ci->resp_body_len = resp_body ? strlen(resp_body) : 0;
-    ci->http_status   = 200;
-    __atomic_store_n((int *)&ci->state, CI_READY, __ATOMIC_SEQ_CST);
-    MHD_resume_connection(ci->mhd_conn);
-    LOGD("sync work done, connection resumed");
-}
-
-/* ── MHD request handler ──────────────────────────────────────────────── */
-static enum MHD_Result handle_request(
-        void *cls,
-        struct MHD_Connection *connection,
-        const char *url,
-        const char *method,
-        const char *version,
-        const char *upload_data,
-        size_t *upload_data_size,
-        void **con_cls)
+/* ── Request handler ──────────────────────────────────────────────────── */
+static enum MHD_Result handle(void *cls,
+    struct MHD_Connection *conn, const char *url, const char *method,
+    const char *version, const char *upload_data,
+    size_t *upload_data_size, void **con_cls)
 {
-    (void)version; (void)url;
-    worker_pool_t *pool = cls;
+    (void)url;(void)version;
+    worker_pool_t *pool=(worker_pool_t *)cls;
 
-    /* ── First call: allocate connection state ── */
-    if (*con_cls == NULL) {
-        /* Handle CORS preflight */
-        if (strcmp(method, "OPTIONS") == 0) {
-            struct MHD_Response *r =
-                MHD_create_response_from_buffer(0, "", MHD_RESPMEM_PERSISTENT);
-            add_common_headers(r);
-            MHD_add_response_header(r, "Access-Control-Allow-Methods", "POST, OPTIONS");
-            MHD_add_response_header(r, "Allow", "POST, OPTIONS");
-            enum MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_OK, r);
-            MHD_destroy_response(r);
-            return ret;
+    /* First call */
+    if(!*con_cls){
+        if(strcmp(method,"OPTIONS")==0){
+            struct MHD_Response *r=MHD_create_response_from_buffer(0,"",MHD_RESPMEM_PERSISTENT);
+            add_headers(r);
+            MHD_add_response_header(r,"Access-Control-Allow-Methods","POST, OPTIONS");
+            enum MHD_Result ret=MHD_queue_response(conn,MHD_HTTP_OK,r);
+            MHD_destroy_response(r);return ret;
         }
-        /* Only POST is valid for JSONRPC */
-        if (strcmp(method, "POST") != 0) {
-            return send_json(connection, MHD_HTTP_METHOD_NOT_ALLOWED,
-                jrpc_build_error("null", JRPC_ERR_INVALID_REQ,
-                                  "Only POST is accepted"));
-        }
-        conn_info_t *ci = calloc(1, sizeof(*ci));
-        if (!ci) return MHD_NO;
-        ci->state    = CI_READING;
-        ci->mhd_conn = connection;
-        ci->http_status = 200;
-        *con_cls = ci;
-        return MHD_YES;
+        if(strcmp(method,"POST")!=0)
+            return send_json(conn,MHD_HTTP_METHOD_NOT_ALLOWED,
+                jrpc_error("null",JRPC_INVALID_REQ,"Only POST accepted"));
+        conn_info_t *ci=calloc(1,sizeof(*ci));
+        if(!ci)return MHD_NO;
+        ci->state=CI_READING; ci->mhd_conn=conn; ci->http_status=200;
+        *con_cls=ci; return MHD_YES;
     }
 
-    conn_info_t *ci = *con_cls;
+    conn_info_t *ci=*con_cls;
 
-    /* ── Accumulate request body ── */
-    if (*upload_data_size > 0) {
-        if (ci->req_body_len + *upload_data_size > MAX_BODY_SIZE) {
-            ci->body_too_large = true;
-            *upload_data_size = 0;
-            return MHD_YES;
-        }
-        size_t new_len = ci->req_body_len + *upload_data_size;
-        if (new_len + 1 > ci->req_body_cap) {
-            size_t new_cap = (new_len + 1) * 2;
-            char *nb = realloc(ci->req_body, new_cap);
-            if (!nb) return MHD_NO;
-            ci->req_body     = nb;
-            ci->req_body_cap = new_cap;
-        }
-        memcpy(ci->req_body + ci->req_body_len, upload_data, *upload_data_size);
-        ci->req_body_len += *upload_data_size;
-        ci->req_body[ci->req_body_len] = '\0';
-        *upload_data_size = 0;
-        return MHD_YES;
+    /* Accumulate body */
+    if(*upload_data_size>0){
+        if(ci->req_len+*upload_data_size>MAX_BODY_SIZE){
+            ci->too_large=true; *upload_data_size=0; return MHD_YES;}
+        size_t nl=ci->req_len+*upload_data_size;
+        if(nl+1>ci->req_cap){
+            size_t nc=(nl+1)*2;
+            char *nb=realloc(ci->req,nc);if(!nb)return MHD_NO;
+            ci->req=nb;ci->req_cap=nc;}
+        memcpy(ci->req+ci->req_len,upload_data,*upload_data_size);
+        ci->req_len+=*upload_data_size;
+        ci->req[ci->req_len]='\0';
+        *upload_data_size=0; return MHD_YES;
     }
 
-    /* ── Body complete; not yet submitted to worker ── */
-    if (ci->state == CI_READING) {
+    /* Body complete — first time */
+    if(ci->state==CI_READING){
+        if(ci->too_large)
+            return send_json(conn,MHD_HTTP_CONTENT_TOO_LARGE,
+                jrpc_error("null",JRPC_INVALID_REQ,"Body too large"));
+        if(!ci->req||ci->req_len==0)
+            return send_json(conn,MHD_HTTP_BAD_REQUEST,
+                jrpc_error("null",JRPC_PARSE,"Empty body"));
 
-        if (ci->body_too_large) {
-            return send_json(connection, MHD_HTTP_CONTENT_TOO_LARGE,
-                jrpc_build_error("null", JRPC_ERR_INVALID_REQ, "Request body too large"));
-        }
-        if (!ci->req_body || ci->req_body_len == 0) {
-            return send_json(connection, MHD_HTTP_BAD_REQUEST,
-                jrpc_build_error("null", JRPC_ERR_PARSE, "Empty body"));
-        }
+        /* Parse */
+        char *perr=NULL;
+        jrpc_req_t *req=jrpc_parse(ci->req,ci->req_len,&perr);
+        if(!req)return send_json(conn,MHD_HTTP_BAD_REQUEST,perr);
 
-        /* Parse JSONRPC */
-        char *parse_err = NULL;
-        jrpc_req_t *req = jrpc_parse(ci->req_body, ci->req_body_len, &parse_err);
-        if (!req) {
-            LOGW("jrpc_parse failed");
-            return send_json(connection, MHD_HTTP_BAD_REQUEST, parse_err);
-        }
-
-        /* Authenticate */
-        if (!auth_verify(req->session, &req->user)) {
-            LOGW("auth failed for session='%.32s'", req->session);
-            char *err = jrpc_build_error(req->id_str, JRPC_ERR_AUTH,
-                                          "Authentication failed");
+        /* Auth */
+        if(!auth_verify(req->session,&req->user)){
+            LOGW("auth failed session=%.32s",req->session);
+            char *e=jrpc_error(req->id_str,JRPC_AUTH,"Authentication failed");
             jrpc_req_free(req);
-            return send_json(connection, MHD_HTTP_UNAUTHORIZED, err);
+            return send_json(conn,MHD_HTTP_UNAUTHORIZED,e);
         }
-        LOGD("auth ok user=%s method=%s", req->user.username, req->method);
+        LOGD("auth ok user=%s method=%s",req->user.username,req->method);
 
-        /* Look up method */
-        const method_entry_t *entry = methods_lookup(req->method);
-        if (!entry) {
-            char err_msg[256];
-            snprintf(err_msg, sizeof(err_msg), "Method not found: %s", req->method);
-            char *err = jrpc_build_error(req->id_str, JRPC_ERR_METHOD_NOTFOUND, err_msg);
+        /* Lookup */
+        const method_entry_t *entry=methods_lookup(req->method);
+        if(!entry){
+            char em[160];
+            snprintf(em,sizeof(em),"Method not found: %s",req->method);
+            char *e=jrpc_error(req->id_str,JRPC_METHOD_NF,em);
             jrpc_req_free(req);
-            return send_json(connection, MHD_HTTP_OK, err);
+            return send_json(conn,MHD_HTTP_OK,e);
         }
 
-        /* ── Async path: return ACCEPTED immediately ── */
-        if (entry->is_async) {
-            char task_id[37];
-            task_t *task = task_create(req->method, &req->user,
-                                        req->params_json,
-                                        entry->timeout_secs,
-                                        task_id);
-            if (!task) {
-                char *err = jrpc_build_error(req->id_str, JRPC_ERR_INTERNAL, "OOM");
-                jrpc_req_free(req);
-                return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, err);
+        /* ── ASYNC ──────────────────────────────────────────────────── */
+        if(entry->is_async){
+            task_t *task=task_create(req->method,&req->user,
+                                      req->params_json,entry->timeout_secs,NULL);
+            if(!task){
+                char *e=jrpc_error(req->id_str,JRPC_INTERNAL,"OOM");
+                jrpc_req_free(req); return send_json(conn,500,e);
             }
+            /*
+             * task->fn and entry->async_fn are both task_work_fn_t
+             * = work_fn_t = void(*)(void *).
+             * Direct assignment — no cast, no wrapper.
+             */
+            task->fn = entry->async_fn;
 
-            /* Submit async work to pool */
-            entry->async_fn(task_id, &req->user, req->params_json);
-            LOGI("async task created id=%s method=%s user=%s",
-                 task_id, req->method, req->user.username);
+            if(!worker_pool_submit(pool,task_runner,(void *)task))
+                task_mark_failed(task,JRPC_QUEUE_FULL,"Worker queue full");
 
-            char *accepted = jrpc_build_accepted(req->id_str, task_id,
-                                                   entry->timeout_secs);
+            LOGI("async queued id=%s method=%s user=%s",
+                 task->task_id,req->method,req->user.username);
+            char *acc=jrpc_accepted(req->id_str,task->task_id,entry->timeout_secs);
             jrpc_req_free(req);
-            return send_json(connection, MHD_HTTP_ACCEPTED, accepted);
+            return send_json(conn,MHD_HTTP_ACCEPTED,acc);
         }
 
-        /* ── Sync path: suspend connection, dispatch to worker ── */
-        sync_work_ctx_t *ctx = malloc(sizeof(*ctx));
-        if (!ctx) {
-            char *err = jrpc_build_error(req->id_str, JRPC_ERR_INTERNAL, "OOM");
-            jrpc_req_free(req);
-            return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, err);
+        /* ── SYNC: suspend → worker → resume ────────────────────────── */
+        sync_ctx_t *ctx=malloc(sizeof(*ctx));
+        if(!ctx){
+            char *e=jrpc_error(req->id_str,JRPC_INTERNAL,"OOM");
+            jrpc_req_free(req); return send_json(conn,500,e);
         }
-        ctx->ci    = ci;
-        ctx->req   = req;
-        ctx->entry = entry;
-
-        ci->state = CI_PROCESSING;
-        MHD_suspend_connection(connection);
-
-        if (!worker_pool_submit(pool, do_sync_work, ctx)) {
-            /* Queue full — resume immediately with error */
-            jrpc_req_free(req);
-            free(ctx);
-            ci->resp_body = jrpc_build_error(req->id_str,
-                                              JRPC_ERR_QUEUE_FULL,
-                                              "Server busy, retry later");
-            ci->resp_body_len = strlen(ci->resp_body);
-            ci->http_status   = MHD_HTTP_SERVICE_UNAVAILABLE;
-            __atomic_store_n((int *)&ci->state, CI_READY, __ATOMIC_SEQ_CST);
-            MHD_resume_connection(connection);
+        ctx->ci=ci; ctx->req=req; ctx->entry=entry;
+        ci->state=CI_PROCESSING;
+        MHD_suspend_connection(conn);
+        if(!worker_pool_submit(pool,do_sync,(void *)ctx)){
+            jrpc_req_free(req); free(ctx);
+            ci->resp=jrpc_error("null",JRPC_QUEUE_FULL,"Server busy");
+            ci->http_status=503;
+            __atomic_store_n((int*)&ci->state,CI_READY,__ATOMIC_SEQ_CST);
+            MHD_resume_connection(conn);
         }
         return MHD_YES;
     }
 
-    /* ── Worker done; state == CI_READY; send response ── */
-    if (ci->state == CI_READY) {
-        if (!ci->resp_body) {
-            ci->resp_body     = strdup("{\"error\":\"internal\"}");
-            ci->resp_body_len = strlen(ci->resp_body);
-        }
-        return send_json(connection, ci->http_status, ci->resp_body);
-        /* NB: ci->resp_body ownership transferred to MHD via MUST_FREE.
-         * Do NOT free ci->resp_body here. */
+    /* Worker finished — send response */
+    if(ci->state==CI_READY){
+        if(!ci->resp)ci->resp=strdup("{\"error\":\"internal\"}");
+        return send_json(conn,ci->http_status,ci->resp);
+        /* ci->resp ownership transferred to MHD (MUST_FREE) */
     }
 
-    LOGE("handle_request: unexpected state %d", (int)ci->state);
+    LOGE("handle: unexpected state %d",(int)ci->state);
     return MHD_NO;
 }
 
-/* ── Connection cleanup ───────────────────────────────────────────────── */
-static void on_request_done(void *cls,
-                             struct MHD_Connection *connection,
-                             void **con_cls,
-                             enum MHD_RequestTerminationCode toe) {
-    (void)cls; (void)connection; (void)toe;
-    conn_info_t *ci = *con_cls;
-    if (!ci) return;
-    free(ci->req_body);
-    /* resp_body was transferred to MHD (MUST_FREE) — already freed */
-    free(ci);
-    *con_cls = NULL;
+static void on_done(void *cls, struct MHD_Connection *c,
+                    void **con_cls, enum MHD_RequestTerminationCode toe){
+    (void)cls;(void)c;(void)toe;
+    conn_info_t *ci=*con_cls;
+    if(!ci)return;
+    free(ci->req);
+    /* ci->resp was transferred to MHD as MUST_FREE — already freed */
+    free(ci); *con_cls=NULL;
 }
 
-/* ── Public API ───────────────────────────────────────────────────────── */
-struct MHD_Daemon *server_start(uint16_t port,
-                                 unsigned int thread_count,
-                                 worker_pool_t *pool) {
-    unsigned int flags =
-        MHD_USE_INTERNAL_POLLING_THREAD |
-        MHD_ALLOW_SUSPEND_RESUME        |
-        MHD_USE_ERROR_LOG;
-
-    /* Use epoll on Linux for better performance */
-#ifdef MHD_USE_EPOLL
-    flags |= MHD_USE_EPOLL;
-#endif
-
-    struct MHD_Daemon *d = MHD_start_daemon(
-        flags, port,
-        NULL, NULL,                         /* accept policy (all)         */
-        handle_request, pool,               /* handler + cls               */
-        MHD_OPTION_THREAD_POOL_SIZE,  thread_count,
-        MHD_OPTION_CONNECTION_LIMIT,  (unsigned int)MAX_CONCURRENT_CONNS,
+struct MHD_Daemon *server_start(uint16_t port, unsigned int mhd_threads,
+                                 worker_pool_t *pool){
+    unsigned int flags=MHD_USE_INTERNAL_POLLING_THREAD|
+                       MHD_ALLOW_SUSPEND_RESUME|
+                       MHD_USE_ERROR_LOG;
+    struct MHD_Daemon *d=MHD_start_daemon(
+        flags,port,NULL,NULL,handle,pool,
+        MHD_OPTION_THREAD_POOL_SIZE, mhd_threads,
+        MHD_OPTION_CONNECTION_LIMIT, (unsigned int)MAX_CONNS,
         MHD_OPTION_CONNECTION_TIMEOUT,(unsigned int)CONN_TIMEOUT_SECS,
-        MHD_OPTION_NOTIFY_COMPLETED,  on_request_done, NULL,
+        MHD_OPTION_NOTIFY_COMPLETED, on_done,NULL,
         MHD_OPTION_END);
-
-    if (!d) {
-        LOGE("MHD_start_daemon failed on port %d", (int)port);
-        return NULL;
-    }
-    LOGI("server listening on port %d (threads=%u, max_conn=%d)",
-         (int)port, thread_count, MAX_CONCURRENT_CONNS);
+    if(!d){LOGE("MHD_start_daemon failed port=%d",(int)port);return NULL;}
+    LOGI("server port=%d mhd_threads=%u max_conn=%d",(int)port,mhd_threads,MAX_CONNS);
     return d;
 }
-
-void server_stop(struct MHD_Daemon *d) {
-    if (d) {
-        MHD_stop_daemon(d);
-        LOGI("server stopped");
-    }
-}
+void server_stop(struct MHD_Daemon *d){if(d){MHD_stop_daemon(d);LOGI("server stopped");}}
